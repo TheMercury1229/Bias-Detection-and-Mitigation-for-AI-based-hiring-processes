@@ -1,16 +1,24 @@
 """Streamlit dashboard for AI hiring fairness analysis and mitigation."""
 
 from __future__ import annotations
-from src.models.train_model import build_model, train_baseline_model, train_model
-from src.models.evaluate_model import compare_baseline_and_mitigated_models, evaluate_predictions
-from src.mitigation.strategy_recommender import recommend_mitigation_strategies
+from src.data.preprocess import preprocess_dataset
+from src.data.schema_validator import validate_dataset_schema
 from src.mitigation.mitigation_methods import (
     apply_data_reweighing,
     train_fairness_constrained_model,
     train_threshold_optimizer,
 )
-from src.data.schema_validator import validate_dataset_schema
-from src.data.preprocess import preprocess_dataset
+from src.mitigation.strategy_simulator import simulate_mitigation_strategies
+from src.mitigation.strategy_recommender import recommend_mitigation_strategies
+from src.mitigation.strategy_comparator import compare_mitigation_strategies
+from src.models.train_model import build_model, train_baseline_model, train_model
+from src.models.evaluate_model import (
+    compare_baseline_and_mitigated_models,
+    evaluate_predictions,
+)
+from src.explainability.shap_explainer import compute_shap_values
+from src.explainability.group_explainer import analyze_group_shap_values
+from src.explainability.bias_explainer import generate_bias_explanations
 from src.bias_detection.bias_identifier import identify_bias_type
 
 import sys
@@ -89,10 +97,103 @@ def _display_comparison_charts(comparison: dict[str, Any]) -> None:
     st.dataframe(delta_df, use_container_width=True)
 
 
+def _run_strategy_simulation(baseline_state: dict[str, Any]) -> dict[str, Any]:
+    """Run and rank mitigation strategy simulations for the current dataset."""
+    recommended = baseline_state["strategy_result"].get(
+        "recommended_strategies", [])
+    strategy_names = [item["name"] for item in recommended] or [
+        "Continuous Fairness Monitoring"
+    ]
+
+    simulation_results = simulate_mitigation_strategies(
+        X_train=baseline_state["X_train"],
+        X_test=baseline_state["X_test"],
+        y_train=baseline_state["y_train"],
+        y_test=baseline_state["y_test"],
+        sensitive_train=baseline_state["sensitive_train"],
+        sensitive_test=baseline_state["sensitive_test"],
+        strategies=strategy_names,
+        model=baseline_state["baseline_model"],
+        model_type=baseline_state["baseline_model_type"],
+        sensitive_column=baseline_state["sensitive_column"],
+        random_state=42,
+    )
+    return compare_mitigation_strategies(simulation_results)
+
+
+def _display_explainability_section(
+        model: Any,
+        X: pd.DataFrame,
+        sensitive_features: pd.Series,
+        sensitive_column: str,
+) -> None:
+    """Render SHAP-based explainability views and bias insights."""
+    st.subheader("Explainability")
+    st.caption(
+        "This section shows which features most influenced the model overall, "
+        "and how those influences differ across demographic groups."
+    )
+
+    if not hasattr(model, "estimators_"):
+        st.warning(
+            "SHAP explanations are available only for tree-based models. "
+            "Select Random Forest as the baseline model to view explainability results."
+        )
+        return
+
+    try:
+        shap_result = compute_shap_values(
+            model=model, X=X, feature_names=list(X.columns))
+        shap_values = pd.DataFrame(
+            shap_result["shap_values"], columns=shap_result["feature_names"]
+        )
+        overall_importance = shap_values.abs().mean().sort_values(ascending=False)
+
+        st.markdown("### Overall Feature Importance")
+        importance_df = overall_importance.head(
+            10).rename("mean_abs_shap").reset_index()
+        importance_df.columns = ["feature", "mean_abs_shap"]
+        st.dataframe(importance_df, use_container_width=True)
+        st.bar_chart(importance_df.set_index("feature"))
+
+        group_comparison = analyze_group_shap_values(
+            model=model,
+            X=X,
+            sensitive_features=sensitive_features,
+            feature_names=list(X.columns),
+        )
+
+        st.markdown("### Group-wise SHAP Comparison")
+        comparison_df = pd.DataFrame(group_comparison).T
+        if not comparison_df.empty:
+            group_spread = (comparison_df.max(axis=0) - comparison_df.min(axis=0)).sort_values(
+                ascending=False
+            )
+            top_features = group_spread.head(10).index.tolist()
+            comparison_subset = comparison_df[top_features].T
+            st.dataframe(comparison_df, use_container_width=True)
+            st.bar_chart(comparison_subset)
+        else:
+            st.info("No group-level SHAP comparison could be generated.")
+
+        bias_insights = generate_bias_explanations(group_comparison)
+        st.markdown("### Human-Readable Bias Insights")
+        for insight in bias_insights["insights"]:
+            st.write(f"- {insight}")
+
+        st.markdown(
+            "The charts above help identify whether the model relies on certain "
+            f"features more heavily for {sensitive_column} groups, which may indicate proxy bias or unequal treatment."
+        )
+    except Exception as exc:
+        st.error(f"Explainability analysis failed: {exc}")
+
+
 def _run_baseline_analysis(
         df: pd.DataFrame,
         target_column: str,
         sensitive_column: str,
+    model_type: str,
         test_size: float,
 ) -> dict[str, Any]:
     validate_dataset_schema(
@@ -121,7 +222,7 @@ def _run_baseline_analysis(
     baseline_model = train_baseline_model(
         X_train=X_train,
         y_train=y_train,
-        model_type="logistic_regression",
+        model_type=model_type,
         random_state=42,
     )
     y_pred_baseline = baseline_model.predict(X_test)
@@ -151,6 +252,7 @@ def _run_baseline_analysis(
         "sensitive_train": sensitive_train,
         "sensitive_test": sensitive_test,
         "baseline_model": baseline_model,
+        "baseline_model_type": model_type,
         "y_pred_baseline": y_pred_baseline,
         "baseline_eval": baseline_eval,
         "bias_result": bias_result,
@@ -281,6 +383,12 @@ def main() -> None:
         "Select sensitive attribute column",
         sensitive_candidates,
     )
+    model_type = st.selectbox(
+        "Select baseline model type for explainability",
+        options=["random_forest", "logistic_regression"],
+        format_func=lambda value: "Random Forest" if value == "random_forest" else "Logistic Regression",
+        index=0,
+    )
     test_size = st.slider("Test size", min_value=0.1,
                           max_value=0.5, value=0.2, step=0.05)
 
@@ -290,9 +398,13 @@ def main() -> None:
                 df=df,
                 target_column=target_column,
                 sensitive_column=sensitive_column,
+                model_type=model_type,
                 test_size=test_size,
             )
             st.session_state["baseline_state"] = baseline_state
+            st.session_state["strategy_comparison"] = _run_strategy_simulation(
+                baseline_state=baseline_state,
+            )
         except Exception as exc:
             st.error(f"Analysis failed: {exc}")
             return
@@ -304,6 +416,7 @@ def main() -> None:
     baseline_eval = baseline_state["baseline_eval"]
     bias_result = baseline_state["bias_result"]
     strategy_result = baseline_state["strategy_result"]
+    strategy_comparison = st.session_state["strategy_comparison"]
 
     st.subheader("Fairness Metrics (Baseline)")
     st.dataframe(
@@ -320,19 +433,78 @@ def main() -> None:
     st.write(f"Severity Score: {bias_result['severity_score']}")
     st.write(bias_result["explanation"])
 
+    _display_explainability_section(
+        model=baseline_state["baseline_model"],
+        X=baseline_state["X_test"],
+        sensitive_features=baseline_state["sensitive_test"],
+        sensitive_column=baseline_state["sensitive_column"],
+    )
+
     st.subheader("Recommended Mitigation Strategies")
     strategy_table = pd.DataFrame(strategy_result["recommended_strategies"])
     st.table(strategy_table)
 
-    strategy_names = strategy_table["name"].tolist(
-    ) if not strategy_table.empty else []
+    st.subheader("Strategy Simulation")
+    st.caption(
+        "Compare fairness and accuracy before retraining. Lower fairness scores are better."
+    )
+    simulation_df = pd.DataFrame(strategy_comparison["sorted_results"])
+    if not simulation_df.empty:
+        display_columns = [
+            column
+            for column in [
+                "strategy",
+                "accuracy",
+                "fairness",
+                "fairness_improvement",
+                "accuracy_retention",
+                "rank_score",
+            ]
+            if column in simulation_df.columns
+        ]
+        st.dataframe(simulation_df[display_columns], use_container_width=True)
+        chart_columns = [column for column in ["accuracy",
+                                               "fairness"] if column in simulation_df.columns]
+        if chart_columns:
+            st.bar_chart(simulation_df.set_index("strategy")[chart_columns])
+
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        with metric_col1:
+            st.metric(
+                "Best fairness",
+                strategy_comparison["best_fairness_strategy"]["strategy"],
+            )
+        with metric_col2:
+            st.metric(
+                "Best accuracy",
+                strategy_comparison["best_accuracy_strategy"]["strategy"],
+            )
+        with metric_col3:
+            st.metric(
+                "Balanced choice",
+                strategy_comparison["balanced_choice"]["strategy"],
+            )
+    else:
+        st.info("No strategy simulation results available.")
+
+    strategy_names = simulation_df["strategy"].tolist(
+    ) if not simulation_df.empty else []
     if not strategy_names:
         st.warning(
             "No mitigation strategies available for the detected bias type.")
         return
 
+    default_strategy = strategy_comparison["balanced_choice"]["strategy"]
+    default_index = (
+        strategy_names.index(default_strategy)
+        if default_strategy in strategy_names
+        else 0
+    )
     selected_strategy = st.selectbox(
-        "Select mitigation strategy", strategy_names)
+        "Select mitigation strategy",
+        strategy_names,
+        index=default_index,
+    )
 
     if st.button("Train Fairness-Mitigated Model"):
         try:
