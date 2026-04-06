@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+
+# Suppress sklearn warnings for class imbalance and regression detection
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 
 def _to_dataframe(X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
@@ -75,11 +79,13 @@ def build_model(
     if key in {"logistic_regression", "logistic", "lr"}:
         params.setdefault("max_iter", 1000)
         params.setdefault("random_state", random_state)
+        params.setdefault("class_weight", "balanced")
         return LogisticRegression(**params)
 
     if key in {"random_forest", "rf", "randomforest"}:
         params.setdefault("n_estimators", 200)
         params.setdefault("random_state", random_state)
+        params.setdefault("class_weight", "balanced")
         return RandomForestClassifier(**params)
 
     raise ValueError(
@@ -106,6 +112,12 @@ def train_model(
         sample_weight=sample_weight,
     )
 
+    # Validate that target is classification (binary or multiclass)
+    unique_classes = y_series.nunique()
+    if unique_classes < 2:
+        raise ValueError(
+            f"Target must have at least 2 classes for classification. Found {unique_classes}.")
+
     model = build_model(
         model_type=model_type,
         model_params=model_params,
@@ -116,7 +128,11 @@ def train_model(
     if sample_weight_series is not None:
         fit_kwargs["sample_weight"] = sample_weight_series
 
-    model.fit(X_df, y_series, **fit_kwargs)
+    # Fit with sklearn warnings suppressed for class imbalance
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', UserWarning)
+        model.fit(X_df, y_series, **fit_kwargs)
+
     return model
 
 

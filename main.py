@@ -5,37 +5,45 @@ python main.py --data data/hiring.csv --target hired --sensitive gender
 """
 
 from __future__ import annotations
-
-import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Any
-
-import pandas as pd
-from joblib import dump, load
-
-from src.bias_detection.bias_identifier import identify_bias_type
-from src.bias_detection.bias_diagnosis import diagnose_bias_root_causes
-from src.bias_detection.correlation_analyzer import (
-    analyze_feature_correlation_with_sensitive_attribute,
-)
-from src.bias_detection.data_analyzer import (
-    analyze_group_distribution_and_selection_rate,
-)
-from src.data.load_data import load_dataset
-from src.data.preprocess import preprocess_dataset
-from src.data.schema_validator import validate_dataset_schema
+from src.models.train_model import build_model, train_baseline_model, train_model
+from src.models.evaluate_model import compare_baseline_and_mitigated_models, evaluate_predictions
+from src.mitigation.strategy_simulator import simulate_mitigation_strategies
+from src.mitigation.strategy_recommender import recommend_mitigation_strategies
+from src.mitigation.strategy_comparator import compare_mitigation_strategies
 from src.mitigation.mitigation_methods import (
     apply_data_reweighing,
     train_fairness_constrained_model,
     train_threshold_optimizer,
 )
-from src.mitigation.strategy_comparator import compare_mitigation_strategies
-from src.mitigation.strategy_recommender import recommend_mitigation_strategies
-from src.mitigation.strategy_simulator import simulate_mitigation_strategies
-from src.models.evaluate_model import compare_baseline_and_mitigated_models, evaluate_predictions
-from src.models.train_model import build_model, train_baseline_model, train_model
+from src.data.schema_validator import validate_dataset_schema
+from src.data.preprocess import preprocess_dataset
+from src.data.load_data import load_dataset
+from src.bias_detection.data_analyzer import (
+    analyze_group_distribution_and_selection_rate,
+)
+from src.bias_detection.correlation_analyzer import (
+    analyze_feature_correlation_with_sensitive_attribute,
+)
+from src.bias_detection.bias_diagnosis import diagnose_bias_root_causes
+from src.bias_detection.bias_identifier import identify_bias_type
+from joblib import dump, load
+import pandas as pd
+
+import argparse
+import json
+import os
+import sys
+import warnings
+from pathlib import Path
+from typing import Any
+
+# Configure runtime before importing modules that may transitively load TensorFlow/inFairness.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, module=r"inFairness.*")
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, module=r"keras.*")
 
 
 def ensure_output_dirs(base_dir: str | Path = "results") -> dict[str, Path]:
@@ -322,10 +330,13 @@ def run_pipeline(
             normalize=True, dropna=False).to_dict()
     )
 
+    positive_label = _infer_positive_label(df[target_column])
+
     dataset_analysis = analyze_group_distribution_and_selection_rate(
         df=df,
         sensitive_attribute=sensitive_column,
         target_column=target_column,
+        positive_label=positive_label,
     )
     correlation_analysis = analyze_feature_correlation_with_sensitive_attribute(
         df=df.drop(columns=[target_column], errors="ignore"),
@@ -376,6 +387,7 @@ def run_pipeline(
         "sensitive_test": sensitive_test,
         "sensitive_column": sensitive_column,
         "baseline_model": baseline_model,
+        "baseline_model_type": model_type,
         "y_pred_baseline": y_pred_baseline,
     }
 
@@ -524,6 +536,23 @@ def _infer_column(columns: list[str], preferred_names: list[str]) -> str | None:
         if name.lower() in normalized:
             return normalized[name.lower()]
     return None
+
+
+def _infer_positive_label(target_series: pd.Series) -> Any:
+    """Infer a positive target label for reporting-oriented diagnostics."""
+    values = target_series.dropna().unique().tolist()
+    if len(values) != 2:
+        return 1
+
+    if set(values).issubset({0, 1}) or set(values).issubset({-1, 1}):
+        return 1
+
+    normalized = {str(value).strip().lower(): value for value in values}
+    for candidate in ["1", "true", "yes", "y", "hired", "selected", "positive"]:
+        if candidate in normalized:
+            return normalized[candidate]
+
+    return sorted(values, key=lambda value: str(value).lower())[-1]
 
 
 def main() -> None:

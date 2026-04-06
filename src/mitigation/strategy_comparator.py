@@ -10,8 +10,30 @@ from typing import Any
 
 
 def _validate_results(simulation_results: list[dict[str, Any]]) -> None:
-    if not isinstance(simulation_results, list) or not simulation_results:
-        raise ValueError("simulation_results must be a non-empty list.")
+    if not isinstance(simulation_results, list):
+        raise ValueError("simulation_results must be a list.")
+
+
+def _empty_report() -> dict[str, Any]:
+    return {
+        "sorted_results": [],
+        "best_fairness_strategy": {
+            "strategy": None,
+            "fairness": None,
+            "accuracy": None,
+        },
+        "best_accuracy_strategy": {
+            "strategy": None,
+            "accuracy": None,
+            "fairness": None,
+        },
+        "balanced_choice": {
+            "strategy": None,
+            "rank_score": None,
+            "fairness": None,
+            "accuracy": None,
+        },
+    }
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -26,6 +48,8 @@ def compare_mitigation_strategies(
 ) -> dict[str, Any]:
     """Rank mitigation strategies based on fairness vs accuracy trade-offs."""
     _validate_results(simulation_results)
+    if not simulation_results:
+        return _empty_report()
 
     normalized_results: list[dict[str, Any]] = []
     best_gain = max(

@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score
 
+# Suppress sklearn warnings for class imbalance
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+
 try:
     from src.bias_detection.fairness_metrices import compute_fairness_metrics
 except ImportError:
-    from ..bias_detection.fairness_metrices import compute_fairness_metrics
+    try:
+        from src.bias_detection.fairness_metrics import compute_fairness_metrics
+    except ImportError:
+        from ..bias_detection.fairness_metrices import compute_fairness_metrics
 
 
 def _to_numpy_1d(values: pd.Series | np.ndarray | list[Any]) -> np.ndarray:

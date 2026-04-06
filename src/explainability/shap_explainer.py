@@ -108,8 +108,50 @@ def compute_shap_values(
             else expected_value
         )
     else:
-        selected_shap_values = shap_values
-        selected_expected_value = expected_value
+        values = np.asarray(shap_values)
+        if values.ndim == 2:
+            selected_shap_values = values
+            selected_expected_value = expected_value
+        elif values.ndim == 3:
+            # Handle newer SHAP formats where class dimension is part of ndarray.
+            # Common shape for classifiers: (n_samples, n_features, n_classes).
+            if values.shape[0] == X_df.shape[0] and values.shape[1] == X_df.shape[1]:
+                n_classes = values.shape[2]
+                idx = (1 if n_classes >
+                       1 else 0) if class_index is None else class_index
+                if idx < 0 or idx >= n_classes:
+                    raise ValueError(
+                        f"class_index must be between 0 and {n_classes - 1}."
+                    )
+                selected_shap_values = values[:, :, idx]
+                if isinstance(expected_value, (list, np.ndarray)) and len(np.asarray(expected_value).shape) > 0:
+                    selected_expected_value = np.asarray(
+                        expected_value).ravel()[idx]
+                else:
+                    selected_expected_value = expected_value
+            # Fallback shape occasionally seen: (n_classes, n_samples, n_features).
+            elif values.shape[1] == X_df.shape[0] and values.shape[2] == X_df.shape[1]:
+                n_classes = values.shape[0]
+                idx = (1 if n_classes >
+                       1 else 0) if class_index is None else class_index
+                if idx < 0 or idx >= n_classes:
+                    raise ValueError(
+                        f"class_index must be between 0 and {n_classes - 1}."
+                    )
+                selected_shap_values = values[idx]
+                if isinstance(expected_value, (list, np.ndarray)) and len(np.asarray(expected_value).shape) > 0:
+                    selected_expected_value = np.asarray(
+                        expected_value).ravel()[idx]
+                else:
+                    selected_expected_value = expected_value
+            else:
+                raise ValueError(
+                    f"Unsupported SHAP array shape {values.shape}."
+                )
+        else:
+            raise ValueError(
+                f"Unsupported SHAP output dimension: {values.ndim}."
+            )
 
     return {
         "shap_values": selected_shap_values,

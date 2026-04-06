@@ -6,6 +6,7 @@ fairness and accuracy trade-offs before applying a strategy permanently.
 
 from __future__ import annotations
 
+import gc
 from typing import Any
 
 import numpy as np
@@ -113,12 +114,17 @@ def _simulate_strategy(
         y_pred = temp_model.predict(X_test)
 
     elif normalized_strategy == "Fairness-Constrained Learning":
+        # Use a lightweight estimator for in-processing constraints to avoid
+        # high memory spikes with complex baseline estimators (e.g. RandomForest).
+        fairness_estimator = build_model(
+            model_type="logistic_regression", random_state=random_state
+        )
         temp_model = train_fairness_constrained_model(
             X_train=X_train,
             y_train=y_train,
             sensitive_features=sensitive_train,
             constraint="demographic_parity",
-            base_estimator=base_estimator,
+            base_estimator=fairness_estimator,
             random_state=random_state,
         )
         y_pred = temp_model.predict(X_test)
@@ -127,13 +133,17 @@ def _simulate_strategy(
         "Post-Processing Threshold Optimization",
         "Equalized Odds Post-Processing",
     }:
+        # Threshold optimization is also more stable in memory with logistic base.
+        postprocess_estimator = build_model(
+            model_type="logistic_regression", random_state=random_state
+        )
         constraints = (
             "equalized_odds"
             if normalized_strategy == "Equalized Odds Post-Processing"
             else "demographic_parity"
         )
         temp_model = train_threshold_optimizer(
-            estimator=base_estimator,
+            estimator=postprocess_estimator,
             X_train=X_train,
             y_train=y_train,
             sensitive_features=sensitive_train,
@@ -209,7 +219,11 @@ def simulate_mitigation_strategies(
     sensitive_column: str | None = None,
     random_state: int = 42,
 ) -> list[dict[str, Any]]:
-    """Evaluate mitigation strategies temporarily without modifying the dataset."""
+    """Evaluate mitigation strategies temporarily without modifying the dataset.
+
+    Includes memory-efficient processing with garbage collection between strategies.
+    For large datasets (>5000 rows), limits number of simultaneous strategy evaluations.
+    """
     if not strategies:
         raise ValueError("strategies must be a non-empty list.")
 
@@ -227,7 +241,29 @@ def simulate_mitigation_strategies(
     ):
         raise ValueError("Input lengths must align for train/test splits.")
 
+    # Memory optimization: for large datasets, limit strategy processing
+    dataset_size = len(X_train_df)
+    num_features = X_train_df.shape[1]
+    if dataset_size > 5000 and num_features > 40:
+        print(f"Note: Large dataset detected ({dataset_size} rows, {num_features} features). "
+              f"Limiting strategy evaluations to reduce memory usage.")
+        # Keep only the first 4 unique strategies for large datasets
+        unique_strategies = []
+        for s in strategies:
+            normalized = _normalize_strategy_name(s)
+            if normalized not in unique_strategies:
+                unique_strategies.append(normalized)
+            if len(unique_strategies) >= 4:
+                break
+        strategies = unique_strategies
+
     inferred_model_type = model_type or _infer_model_type(model)
+
+    # For large/high-dimensional datasets, use a lighter model for temporary
+    # strategy simulations to prevent allocation failures in Streamlit runs.
+    simulation_model_type = inferred_model_type
+    if dataset_size * max(1, num_features) >= 120000:
+        simulation_model_type = "logistic_regression"
 
     if model is None and inferred_model_type == "logistic_regression":
         baseline_model = train_baseline_model(
@@ -257,29 +293,42 @@ def simulate_mitigation_strategies(
             continue
         seen_strategies.add(normalized_strategy)
 
-        result = _simulate_strategy(
-            strategy=normalized_strategy,
-            X_train=X_train_df,
-            X_test=X_test_df,
-            y_train=y_train_series,
-            y_test=y_test_series,
-            sensitive_train=sensitive_train_series,
-            sensitive_test=sensitive_test_series,
-            sensitive_column=sensitive_column,
-            model=baseline_model,
-            model_type=inferred_model_type,
-            random_state=random_state,
-        )
-        result["baseline_accuracy"] = baseline_accuracy
-        result["baseline_fairness"] = baseline_fairness
-        result["fairness_improvement"] = float(
-            round(baseline_fairness - result["fairness"], 6)
-        )
-        result["accuracy_retention"] = float(
-            round(result["accuracy"] / baseline_accuracy, 6)
-            if baseline_accuracy > 0
-            else 0.0
-        )
-        simulation_results.append(result)
+        try:
+            result = _simulate_strategy(
+                strategy=normalized_strategy,
+                X_train=X_train_df,
+                X_test=X_test_df,
+                y_train=y_train_series,
+                y_test=y_test_series,
+                sensitive_train=sensitive_train_series,
+                sensitive_test=sensitive_test_series,
+                sensitive_column=sensitive_column,
+                model=baseline_model,
+                model_type=simulation_model_type,
+                random_state=random_state,
+            )
+            result["baseline_accuracy"] = baseline_accuracy
+            result["baseline_fairness"] = baseline_fairness
+            result["fairness_improvement"] = float(
+                round(baseline_fairness - result["fairness"], 6)
+            )
+            result["accuracy_retention"] = float(
+                round(result["accuracy"] / baseline_accuracy, 6)
+                if baseline_accuracy > 0
+                else 0.0
+            )
+            simulation_results.append(result)
+        except MemoryError:
+            print(
+                f"Memory error during {normalized_strategy} simulation. Skipping this strategy.")
+            continue
+        except ValueError as exc:
+            print(
+                f"Strategy '{normalized_strategy}' skipped: {exc}"
+            )
+            continue
+        finally:
+            # Free memory after each strategy
+            gc.collect()
 
     return simulation_results

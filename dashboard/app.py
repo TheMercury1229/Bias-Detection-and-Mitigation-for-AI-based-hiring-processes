@@ -20,17 +20,42 @@ from src.explainability.shap_explainer import compute_shap_values
 from src.explainability.group_explainer import analyze_group_shap_values
 from src.explainability.bias_explainer import generate_bias_explanations
 from src.bias_detection.bias_identifier import identify_bias_type
-
-import sys
-from pathlib import Path
-from typing import Any
-
 import pandas as pd
 import streamlit as st
+import os
+import warnings
+from typing import Any
+from pathlib import Path
+import sys
+
+# Set runtime env and warning filters before importing project modules.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, module=r"inFairness.*")
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, module=r"keras.*")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _is_binary_target(series: pd.Series) -> bool:
+    values = pd.Series(series).dropna().unique().tolist()
+    return len(values) == 2
+
+
+def _safe_sensitive_candidates(df: pd.DataFrame, target_column: str) -> list[str]:
+    """Prefer columns suitable for group fairness metrics (low/medium cardinality)."""
+    candidates: list[str] = []
+    for col in df.columns:
+        if col == target_column:
+            continue
+        unique_count = int(df[col].nunique(dropna=True))
+        if unique_count <= 20:
+            candidates.append(col)
+    return candidates
 
 
 def _to_comparison_df(comparison: dict[str, Any], key: str) -> pd.DataFrame:
@@ -63,14 +88,14 @@ def _display_comparison_charts(comparison: dict[str, Any]) -> None:
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("### Performance Metrics")
-        st.dataframe(perf_df, use_container_width=True)
+        st.dataframe(perf_df, width='stretch')
         if not perf_df.empty:
             chart_df = perf_df.set_index("metric")[["baseline", "mitigated"]]
             st.bar_chart(chart_df)
 
     with col2:
         st.markdown("### Fairness Metrics")
-        st.dataframe(fair_df, use_container_width=True)
+        st.dataframe(fair_df, width='stretch')
         if not fair_df.empty:
             chart_df = fair_df.set_index("metric")[["baseline", "mitigated"]]
             st.bar_chart(chart_df)
@@ -81,20 +106,64 @@ def _display_comparison_charts(comparison: dict[str, Any]) -> None:
         st.dataframe(
             pd.DataFrame(comparison["baseline"]
                          ["performance"]["confusion_matrix"]),
-            use_container_width=True,
+            width='stretch',
         )
     with cm_col2:
         st.markdown("### Mitigated Confusion Matrix")
         st.dataframe(
             pd.DataFrame(comparison["mitigated"]
                          ["performance"]["confusion_matrix"]),
-            use_container_width=True,
+            width='stretch',
         )
 
     st.markdown("### Fairness Improvement Summary")
     delta_df = pd.DataFrame([comparison["delta"]]).T.reset_index()
     delta_df.columns = ["metric", "change"]
-    st.dataframe(delta_df, use_container_width=True)
+    st.dataframe(delta_df, width='stretch')
+
+
+def _display_benchmark_plots(benchmark_df: pd.DataFrame) -> None:
+    """Show baseline model benchmark charts to justify model selection."""
+    if benchmark_df.empty:
+        return
+
+    st.markdown("### Baseline Model Benchmark")
+    st.caption(
+        "Compares unmitigated model candidates before fairness mitigation. "
+        "Lower fairness score is better."
+    )
+    st.dataframe(benchmark_df, width='stretch')
+
+    chart_cols = [col for col in ["accuracy", "fairness_score"]
+                  if col in benchmark_df.columns]
+    if len(chart_cols) == 2:
+        scatter_df = benchmark_df.set_index("model_name")
+        st.scatter_chart(scatter_df[["accuracy", "fairness_score"]])
+
+    value_cols = [col for col in ["accuracy", "demographic_parity_difference",
+                                  "equalized_odds_difference"] if col in benchmark_df.columns]
+    if value_cols:
+        st.bar_chart(benchmark_df.set_index("model_name")[value_cols])
+
+
+def _display_strategy_tradeoff_plots(simulation_df: pd.DataFrame) -> None:
+    """Visualize mitigation trade-offs and ranking signals."""
+    if simulation_df.empty:
+        return
+
+    st.markdown("### Mitigation Trade-off Plots")
+    tradeoff_cols = [col for col in ["accuracy", "fairness"]
+                     if col in simulation_df.columns]
+    if len(tradeoff_cols) == 2:
+        st.scatter_chart(simulation_df.set_index("strategy")[tradeoff_cols])
+
+    signal_cols = [
+        col
+        for col in ["fairness_improvement", "accuracy_retention", "rank_score"]
+        if col in simulation_df.columns
+    ]
+    if signal_cols:
+        st.bar_chart(simulation_df.set_index("strategy")[signal_cols])
 
 
 def _run_strategy_simulation(baseline_state: dict[str, Any]) -> dict[str, Any]:
@@ -126,6 +195,7 @@ def _display_explainability_section(
         X: pd.DataFrame,
         sensitive_features: pd.Series,
         sensitive_column: str,
+    model_type: str | None = None,
 ) -> None:
     """Render SHAP-based explainability views and bias insights."""
     st.subheader("Explainability")
@@ -135,9 +205,13 @@ def _display_explainability_section(
     )
 
     if not hasattr(model, "estimators_"):
+        current_model = model_type or type(model).__name__
         st.warning(
-            "SHAP explanations are available only for tree-based models. "
-            "Select Random Forest as the baseline model to view explainability results."
+            f"⚠️ SHAP feature importance is unavailable.\n\n"
+            f"**Current model:** {current_model}\n\n"
+            f"SHAP TreeExplainer requires tree-based models. "
+            f"To enable this analysis, select **'Random Forest'** as the baseline model type. "
+            f"Logistic Regression and linear models use different explainability methods (e.g., LIME)."
         )
         return
 
@@ -153,7 +227,7 @@ def _display_explainability_section(
         importance_df = overall_importance.head(
             10).rename("mean_abs_shap").reset_index()
         importance_df.columns = ["feature", "mean_abs_shap"]
-        st.dataframe(importance_df, use_container_width=True)
+        st.dataframe(importance_df, width='stretch')
         st.bar_chart(importance_df.set_index("feature"))
 
         group_comparison = analyze_group_shap_values(
@@ -171,7 +245,7 @@ def _display_explainability_section(
             )
             top_features = group_spread.head(10).index.tolist()
             comparison_subset = comparison_df[top_features].T
-            st.dataframe(comparison_df, use_container_width=True)
+            st.dataframe(comparison_df, width='stretch')
             st.bar_chart(comparison_subset)
         else:
             st.info("No group-level SHAP comparison could be generated.")
@@ -233,6 +307,46 @@ def _run_baseline_analysis(
         sensitive_features=sensitive_test,
         model_name="baseline",
     )
+    predicted_positive_rate = float(pd.Series(y_pred_baseline).mean())
+
+    benchmark_rows: list[dict[str, Any]] = []
+    for candidate_model in ["logistic_regression", "random_forest"]:
+        try:
+            candidate = train_baseline_model(
+                X_train=X_train,
+                y_train=y_train,
+                model_type=candidate_model,
+                random_state=42,
+            )
+            candidate_pred = candidate.predict(X_test)
+            candidate_eval = evaluate_predictions(
+                y_true=y_test,
+                y_pred=candidate_pred,
+                sensitive_features=sensitive_test,
+                model_name=candidate_model,
+            )
+            fairness = candidate_eval["fairness"]
+            fairness_score = (
+                abs(float(fairness.get("demographic_parity_difference", 0.0)))
+                + abs(float(fairness.get("equalized_odds_difference", 0.0)))
+                + abs(1.0 - float(fairness.get("disparate_impact_ratio", 1.0)))
+            ) / 3.0
+            benchmark_rows.append(
+                {
+                    "model_name": candidate_model,
+                    "accuracy": float(candidate_eval["performance"].get("accuracy", 0.0)),
+                    "demographic_parity_difference": float(fairness.get("demographic_parity_difference", 0.0)),
+                    "equalized_odds_difference": float(fairness.get("equalized_odds_difference", 0.0)),
+                    "disparate_impact_ratio": float(fairness.get("disparate_impact_ratio", 1.0)),
+                    "fairness_score": float(round(fairness_score, 6)),
+                }
+            )
+        except Exception:
+            # Keep dashboard responsive if one benchmark model fails.
+            continue
+
+    unique_labels = set(pd.Series(y_train).dropna().unique().tolist())
+    is_binary_target_for_mitigation = unique_labels.issubset({0, 1})
 
     fairness_for_bias = dict(baseline_eval["fairness"])
     fairness_for_bias["sensitive_group_distribution"] = (
@@ -258,6 +372,9 @@ def _run_baseline_analysis(
         "bias_result": bias_result,
         "strategy_result": strategy_result,
         "sensitive_column": sensitive_column,
+        "is_binary_target_for_mitigation": is_binary_target_for_mitigation,
+        "benchmark_df": pd.DataFrame(benchmark_rows),
+        "predicted_positive_rate": predicted_positive_rate,
     }
 
 
@@ -271,6 +388,11 @@ def _apply_selected_mitigation(
     sensitive_train = baseline_state["sensitive_train"]
     sensitive_test = baseline_state["sensitive_test"]
     sensitive_column = baseline_state["sensitive_column"]
+
+    if not baseline_state.get("is_binary_target_for_mitigation", True):
+        model = baseline_state["baseline_model"]
+        y_pred = baseline_state["y_pred_baseline"]
+        return model, y_pred
 
     if strategy_name in {"Reweighing", "Data Reweighing"}:
         rw = apply_data_reweighing(X_train, y_train, sensitive_train)
@@ -341,17 +463,97 @@ def _apply_selected_mitigation(
     return model, y_pred
 
 
+def _inject_dashboard_styles() -> None:
+    st.markdown(
+        """
+        <style>
+            .module-card {
+                border: 1px solid rgba(49, 83, 109, 0.22);
+                border-radius: 14px;
+                padding: 14px;
+                background: linear-gradient(140deg, rgba(245,250,255,0.95), rgba(236,246,253,0.85));
+                min-height: 118px;
+            }
+            .module-title {
+                margin: 0;
+                color: #0f2f4f;
+                font-weight: 700;
+                font-size: 1rem;
+            }
+            .module-text {
+                margin-top: 6px;
+                color: #2f455a;
+                font-size: 0.9rem;
+                line-height: 1.35rem;
+            }
+            .stTabs [data-baseweb="tab-list"] {
+                gap: 10px;
+            }
+            .stTabs [data-baseweb="tab"] {
+                border-radius: 999px;
+                border: 1px solid rgba(49, 83, 109, 0.22);
+                background: #f4f8fc;
+                padding: 0.45rem 0.85rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_module_overview() -> None:
+    st.caption(
+        "Module-oriented workflow: Bias Detection -> Explainability -> Mitigation")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(
+            """
+            <div class="module-card">
+                <p class="module-title">1) Bias Detection</p>
+                <p class="module-text">Fairness metrics, selection-rate analysis, and bias-type identification.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            """
+            <div class="module-card">
+                <p class="module-title">2) Explainability</p>
+                <p class="module-text">SHAP feature influence and group-wise contribution analysis.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            """
+            <div class="module-card">
+                <p class="module-title">3) Mitigation</p>
+                <p class="module-text">Strategy simulation, trade-off ranking, and mitigated model comparison.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="AI Hiring Fairness Dashboard", layout="wide")
+    _inject_dashboard_styles()
+
     st.title("AI Hiring Fairness Dashboard")
     st.write(
         "Upload a hiring dataset, detect bias, and compare baseline vs fairness-"
         "mitigated model performance."
     )
+    _render_module_overview()
 
-    uploaded_file = st.file_uploader(
-        "Upload hiring dataset (CSV)", type=["csv"])
+    with st.sidebar:
+        st.header("Pipeline Controls")
+        uploaded_file = st.file_uploader(
+            "Upload hiring dataset (CSV)", type=["csv"])
+
     if uploaded_file is None:
         st.info("Upload a CSV file to begin analysis.")
         return
@@ -362,37 +564,58 @@ def main() -> None:
         st.error(f"Failed to read uploaded file: {exc}")
         return
 
-    st.subheader("Dataset Preview")
-    st.dataframe(df.head(20), use_container_width=True)
-
     if df.empty:
         st.error("The uploaded dataset is empty.")
         return
 
     columns = list(df.columns)
-    target_column = st.selectbox(
-        "Select target column (hiring outcome)", columns)
+    with st.sidebar:
+        target_column = st.selectbox("Target column (hiring outcome)", columns)
 
-    sensitive_candidates = [col for col in columns if col != target_column]
+    sensitive_candidates = _safe_sensitive_candidates(df, target_column)
     if not sensitive_candidates:
         st.error(
-            "Dataset needs at least one non-target column for sensitive attribute.")
+            "No suitable sensitive attribute found with <= 20 unique values. "
+            "Choose a categorical group column (for example gender, ethnicity, age_group)."
+        )
         return
 
-    sensitive_column = st.selectbox(
-        "Select sensitive attribute column",
-        sensitive_candidates,
-    )
-    model_type = st.selectbox(
-        "Select baseline model type for explainability",
-        options=["random_forest", "logistic_regression"],
-        format_func=lambda value: "Random Forest" if value == "random_forest" else "Logistic Regression",
-        index=0,
-    )
-    test_size = st.slider("Test size", min_value=0.1,
-                          max_value=0.5, value=0.2, step=0.05)
+    with st.sidebar:
+        sensitive_column = st.selectbox(
+            "Sensitive attribute column",
+            sensitive_candidates,
+        )
+        model_type = st.selectbox(
+            "Baseline model type",
+            options=["random_forest", "logistic_regression"],
+            format_func=lambda value: "Random Forest" if value == "random_forest" else "Logistic Regression",
+            index=0,
+        )
+        test_size = st.slider("Test size", min_value=0.1,
+                              max_value=0.5, value=0.2, step=0.05)
+        run_clicked = st.button("Run Bias Detection Analysis", type="primary")
 
-    if st.button("Run Bias Detection Analysis", type="primary"):
+    st.subheader("Dataset Preview")
+    st.dataframe(df.head(20), width='stretch')
+
+    if not _is_binary_target(df[target_column]):
+        st.error(
+            "Selected target column is not binary. Fairness metrics and mitigation in this dashboard "
+            "require a binary outcome (exactly 2 unique labels)."
+        )
+        st.info(
+            "Tip: pick a binary target such as hired/selected, or pre-convert your target labels to two classes."
+        )
+        return
+
+    sensitive_unique = int(df[sensitive_column].nunique(dropna=True))
+    if sensitive_unique > 20:
+        st.warning(
+            f"Selected sensitive attribute has {sensitive_unique} unique groups. "
+            "Fairness metrics may be noisy; use a grouped categorical column for clearer analysis."
+        )
+
+    if run_clicked:
         try:
             baseline_state = _run_baseline_analysis(
                 df=df,
@@ -405,6 +628,15 @@ def main() -> None:
             st.session_state["strategy_comparison"] = _run_strategy_simulation(
                 baseline_state=baseline_state,
             )
+            st.session_state.pop("comparison", None)
+            st.session_state.pop("mitigated_model", None)
+        except MemoryError as exc:
+            st.error(
+                "Analysis failed due to memory limits during strategy simulation. "
+                "Try selecting 'Logistic Regression' as baseline model type or use a smaller test size."
+            )
+            st.caption(f"Details: {exc}")
+            return
         except Exception as exc:
             st.error(f"Analysis failed: {exc}")
             return
@@ -417,119 +649,163 @@ def main() -> None:
     bias_result = baseline_state["bias_result"]
     strategy_result = baseline_state["strategy_result"]
     strategy_comparison = st.session_state["strategy_comparison"]
-
-    st.subheader("Fairness Metrics (Baseline)")
-    st.dataframe(
-        pd.DataFrame([baseline_eval["fairness"]]).drop(
-            columns=["selection_rate_by_group"]),
-        use_container_width=True,
-    )
-    st.write("Selection Rate by Group")
-    st.table(pd.DataFrame(baseline_eval["fairness"]["selection_rate_by_group"].items(
-    ), columns=["group", "selection_rate"]))
-
-    st.subheader("Detected Bias Type")
-    st.write(f"Bias Type: {bias_result['detected_bias_type']}")
-    st.write(f"Severity Score: {bias_result['severity_score']}")
-    st.write(bias_result["explanation"])
-
-    _display_explainability_section(
-        model=baseline_state["baseline_model"],
-        X=baseline_state["X_test"],
-        sensitive_features=baseline_state["sensitive_test"],
-        sensitive_column=baseline_state["sensitive_column"],
+    benchmark_df = baseline_state.get("benchmark_df", pd.DataFrame())
+    predicted_positive_rate = float(
+        baseline_state.get("predicted_positive_rate", 0.0)
     )
 
-    st.subheader("Recommended Mitigation Strategies")
-    strategy_table = pd.DataFrame(strategy_result["recommended_strategies"])
-    st.table(strategy_table)
-
-    st.subheader("Strategy Simulation")
-    st.caption(
-        "Compare fairness and accuracy before retraining. Lower fairness scores are better."
+    tab_bias, tab_explain, tab_mitigate = st.tabs(
+        ["Bias Detection", "Explainability", "Mitigation & Comparison"]
     )
-    simulation_df = pd.DataFrame(strategy_comparison["sorted_results"])
-    if not simulation_df.empty:
-        display_columns = [
-            column
-            for column in [
-                "strategy",
-                "accuracy",
-                "fairness",
-                "fairness_improvement",
-                "accuracy_retention",
-                "rank_score",
+
+    with tab_bias:
+        st.subheader("Fairness Metrics (Baseline)")
+        if predicted_positive_rate < 0.02:
+            st.warning(
+                f"Very low predicted positive rate ({predicted_positive_rate:.2%}). "
+                "Model may be collapsing to mostly negative predictions, making fairness comparison less reliable."
+            )
+
+        selection_rate_by_group = baseline_eval["fairness"].get(
+            "selection_rate_by_group", {})
+        if selection_rate_by_group and max(selection_rate_by_group.values()) == 0:
+            st.warning(
+                "All groups have zero selection rate. Fairness metrics are currently not informative "
+                "for mitigation comparison in this run."
+            )
+
+        fairness_df = pd.DataFrame([baseline_eval["fairness"]])
+        if "selection_rate_by_group" in fairness_df.columns:
+            fairness_df = fairness_df.drop(columns=["selection_rate_by_group"])
+        st.dataframe(fairness_df, width='stretch')
+
+        st.write("Selection Rate by Group")
+        selection_rate_items = selection_rate_by_group.items()
+        st.table(pd.DataFrame(selection_rate_items,
+                 columns=["group", "selection_rate"]))
+
+        st.subheader("Detected Bias Type")
+        st.write(f"Bias Type: {bias_result['detected_bias_type']}")
+        st.write(f"Severity Score: {bias_result['severity_score']}")
+        st.write(bias_result["explanation"])
+        _display_benchmark_plots(benchmark_df)
+
+    with tab_explain:
+        _display_explainability_section(
+            model=baseline_state["baseline_model"],
+            X=baseline_state["X_test"],
+            sensitive_features=baseline_state["sensitive_test"],
+            sensitive_column=baseline_state["sensitive_column"],
+            model_type=baseline_state.get("baseline_model_type"),
+        )
+
+    with tab_mitigate:
+        if not baseline_state.get("is_binary_target_for_mitigation", True):
+            st.warning(
+                "Mitigation methods that rely on Fairlearn reductions/post-processing were skipped "
+                "because the selected target is not binary 0/1. Baseline analysis and diagnostics are still shown."
+            )
+
+        st.subheader("Recommended Mitigation Strategies")
+        strategy_table = pd.DataFrame(
+            strategy_result["recommended_strategies"])
+        if strategy_table.empty:
+            st.info("No explicit mitigation strategy was recommended for this run.")
+        else:
+            st.table(strategy_table)
+
+        st.subheader("Strategy Simulation")
+        st.caption(
+            "Compare fairness and accuracy before retraining. Lower fairness scores are better."
+        )
+        simulation_df = pd.DataFrame(
+            strategy_comparison.get("sorted_results", []))
+        if not simulation_df.empty:
+            display_columns = [
+                column
+                for column in [
+                    "strategy",
+                    "accuracy",
+                    "fairness",
+                    "fairness_improvement",
+                    "accuracy_retention",
+                    "rank_score",
+                ]
+                if column in simulation_df.columns
             ]
-            if column in simulation_df.columns
-        ]
-        st.dataframe(simulation_df[display_columns], use_container_width=True)
-        chart_columns = [column for column in ["accuracy",
-                                               "fairness"] if column in simulation_df.columns]
-        if chart_columns:
-            st.bar_chart(simulation_df.set_index("strategy")[chart_columns])
+            st.dataframe(simulation_df[display_columns], width='stretch')
+            chart_columns = [column for column in ["accuracy",
+                                                   "fairness"] if column in simulation_df.columns]
+            if chart_columns:
+                st.bar_chart(simulation_df.set_index(
+                    "strategy")[chart_columns])
 
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-        with metric_col1:
-            st.metric(
-                "Best fairness",
-                strategy_comparison["best_fairness_strategy"]["strategy"],
-            )
-        with metric_col2:
-            st.metric(
-                "Best accuracy",
-                strategy_comparison["best_accuracy_strategy"]["strategy"],
-            )
-        with metric_col3:
-            st.metric(
-                "Balanced choice",
-                strategy_comparison["balanced_choice"]["strategy"],
-            )
-    else:
-        st.info("No strategy simulation results available.")
-
-    strategy_names = simulation_df["strategy"].tolist(
-    ) if not simulation_df.empty else []
-    if not strategy_names:
-        st.warning(
-            "No mitigation strategies available for the detected bias type.")
-        return
-
-    default_strategy = strategy_comparison["balanced_choice"]["strategy"]
-    default_index = (
-        strategy_names.index(default_strategy)
-        if default_strategy in strategy_names
-        else 0
-    )
-    selected_strategy = st.selectbox(
-        "Select mitigation strategy",
-        strategy_names,
-        index=default_index,
-    )
-
-    if st.button("Train Fairness-Mitigated Model"):
-        try:
-            mitigated_model, y_pred_mitigated = _apply_selected_mitigation(
-                strategy_name=selected_strategy,
-                baseline_state=baseline_state,
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            with metric_col1:
+                st.metric(
+                    "Best fairness",
+                    strategy_comparison["best_fairness_strategy"].get(
+                        "strategy") or "N/A",
+                )
+            with metric_col2:
+                st.metric(
+                    "Best accuracy",
+                    strategy_comparison["best_accuracy_strategy"].get(
+                        "strategy") or "N/A",
+                )
+            with metric_col3:
+                st.metric(
+                    "Balanced choice",
+                    strategy_comparison["balanced_choice"].get(
+                        "strategy") or "N/A",
+                )
+            _display_strategy_tradeoff_plots(simulation_df)
+        else:
+            st.warning(
+                "No strategy simulation results were produced. Falling back to continuous monitoring."
             )
 
-            comparison = compare_baseline_and_mitigated_models(
-                y_true=baseline_state["y_test"],
-                y_pred_baseline=baseline_state["y_pred_baseline"],
-                y_pred_mitigated=y_pred_mitigated,
-                sensitive_features=baseline_state["sensitive_test"],
-                baseline_name="baseline",
-                mitigated_name=selected_strategy,
-            )
+        strategy_names = simulation_df["strategy"].tolist(
+        ) if not simulation_df.empty else []
+        if not strategy_names:
+            strategy_names = ["Continuous Fairness Monitoring"]
 
-            st.session_state["mitigated_model"] = mitigated_model
-            st.session_state["comparison"] = comparison
-        except Exception as exc:
-            st.error(f"Mitigated training failed: {exc}")
-            return
+        default_strategy = strategy_comparison.get(
+            "balanced_choice", {}).get("strategy")
+        if default_strategy not in strategy_names:
+            default_strategy = strategy_names[0]
+        default_index = strategy_names.index(default_strategy)
 
-    if "comparison" in st.session_state:
-        _display_comparison_charts(st.session_state["comparison"])
+        selected_strategy = st.selectbox(
+            "Select mitigation strategy",
+            strategy_names,
+            index=default_index,
+        )
+
+        if st.button("Train Fairness-Mitigated Model"):
+            try:
+                mitigated_model, y_pred_mitigated = _apply_selected_mitigation(
+                    strategy_name=selected_strategy,
+                    baseline_state=baseline_state,
+                )
+
+                comparison = compare_baseline_and_mitigated_models(
+                    y_true=baseline_state["y_test"],
+                    y_pred_baseline=baseline_state["y_pred_baseline"],
+                    y_pred_mitigated=y_pred_mitigated,
+                    sensitive_features=baseline_state["sensitive_test"],
+                    baseline_name="baseline",
+                    mitigated_name=selected_strategy,
+                )
+
+                st.session_state["mitigated_model"] = mitigated_model
+                st.session_state["comparison"] = comparison
+            except Exception as exc:
+                st.error(f"Mitigated training failed: {exc}")
+                return
+
+        if "comparison" in st.session_state:
+            _display_comparison_charts(st.session_state["comparison"])
 
 
 if __name__ == "__main__":

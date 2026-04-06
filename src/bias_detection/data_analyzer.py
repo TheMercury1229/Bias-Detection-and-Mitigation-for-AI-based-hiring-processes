@@ -37,11 +37,30 @@ def _to_binary_target(
     return (target_series == positive_label).astype(int)
 
 
+def _infer_positive_label(target_series: pd.Series) -> Any:
+    """Infer a reasonable positive label for binary target columns."""
+    values = target_series.dropna().unique().tolist()
+    if len(values) != 2:
+        return 1
+
+    if set(values).issubset({0, 1}):
+        return 1
+    if set(values).issubset({-1, 1}):
+        return 1
+
+    normalized = {str(value).strip().lower(): value for value in values}
+    for candidate in ["1", "true", "yes", "y", "hired", "selected", "positive"]:
+        if candidate in normalized:
+            return normalized[candidate]
+
+    return sorted(values, key=lambda value: str(value).lower())[-1]
+
+
 def analyze_group_distribution_and_selection_rate(
     df: pd.DataFrame,
     sensitive_attribute: str,
     target_column: str,
-    positive_label: Any = 1,
+    positive_label: Any | None = None,
     fill_missing_group: str = "Unknown",
 ) -> dict[str, dict[str, float | int]]:
     """Analyze group distribution and selection rate for a protected attribute.
@@ -51,6 +70,7 @@ def analyze_group_distribution_and_selection_rate(
         sensitive_attribute: Protected column name (for example: gender).
         target_column: Outcome label column (for example: hired).
         positive_label: Value in target_column interpreted as selected/hired.
+            If None, it is inferred for binary targets.
         fill_missing_group: Label used when sensitive attribute value is missing.
 
     Returns:
@@ -67,6 +87,8 @@ def analyze_group_distribution_and_selection_rate(
     _validate_columns(df, sensitive_attribute, target_column)
 
     groups = df[sensitive_attribute].fillna(fill_missing_group).astype(str)
+    if positive_label is None:
+        positive_label = _infer_positive_label(df[target_column])
     y_selected = _to_binary_target(df[target_column], positive_label)
 
     group_distribution = groups.value_counts(dropna=False).to_dict()
