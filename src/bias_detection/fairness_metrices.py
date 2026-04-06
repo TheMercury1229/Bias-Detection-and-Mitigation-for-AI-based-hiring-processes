@@ -45,6 +45,50 @@ def _validate_inputs(
     return y_true_arr, y_pred_arr, sensitive_arr
 
 
+def _infer_pos_label(y_true_arr: np.ndarray, y_pred_arr: np.ndarray) -> Any:
+    """Infer a stable positive label for binary classification metrics.
+
+    Fairlearn's equalized_odds_difference relies on binary metrics that require
+    a valid pos_label. This helper supports labels like {"Yes", "No"},
+    {True, False}, {"1", "0"}, and numeric binaries.
+    """
+    combined = np.concatenate([y_true_arr, y_pred_arr])
+    unique = pd.unique(pd.Series(combined).dropna())
+
+    if len(unique) != 2:
+        return 1
+
+    label_set = set(unique.tolist())
+
+    preferred_positive = [1, True, "1", "true",
+                          "yes", "y", "hired", "positive"]
+    normalized_to_original: dict[str, Any] = {
+        str(v).strip().lower(): v for v in unique}
+    for candidate in preferred_positive:
+        key = str(candidate).strip().lower()
+        if key in normalized_to_original:
+            return normalized_to_original[key]
+
+    try:
+        ordered = sorted(unique.tolist(), key=lambda value: str(value).lower())
+        return ordered[-1]
+    except Exception:
+        return list(label_set)[-1]
+
+
+def _binarize_labels(
+        y_true_arr: np.ndarray,
+        y_pred_arr: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert binary labels to {0,1} for compatibility across metric versions."""
+    pos_label = _infer_pos_label(y_true_arr, y_pred_arr)
+    y_true_bin = np.asarray(
+        [1 if value == pos_label else 0 for value in y_true_arr])
+    y_pred_bin = np.asarray(
+        [1 if value == pos_label else 0 for value in y_pred_arr])
+    return y_true_bin, y_pred_bin
+
+
 def compute_selection_rate_by_group(
         y_true: pd.Series | np.ndarray,
         y_pred: pd.Series | np.ndarray,
@@ -79,7 +123,9 @@ def compute_disparate_impact_ratio(selection_rates_by_group: dict[str, float]) -
     max_rate = max(rates)
 
     if max_rate == 0:
-        return 0.0
+        # When no group receives positive predictions, DI is not informative.
+        # Use neutral value to avoid falsely signaling severe selection bias.
+        return 1.0
 
     return float(min(rates) / max_rate)
 
@@ -107,20 +153,22 @@ def compute_fairness_metrics(
         y_true, y_pred, sensitive_features
     )
 
+    y_true_bin, y_pred_bin = _binarize_labels(y_true_arr, y_pred_arr)
+
     dp_difference = demographic_parity_difference(
-        y_true=y_true_arr,
-        y_pred=y_pred_arr,
+        y_true=y_true_bin,
+        y_pred=y_pred_bin,
         sensitive_features=sensitive_arr,
     )
     eo_difference = equalized_odds_difference(
-        y_true=y_true_arr,
-        y_pred=y_pred_arr,
+        y_true=y_true_bin,
+        y_pred=y_pred_bin,
         sensitive_features=sensitive_arr,
     )
 
     selection_rates = compute_selection_rate_by_group(
-        y_true=y_true_arr,
-        y_pred=y_pred_arr,
+        y_true=y_true_bin,
+        y_pred=y_pred_bin,
         sensitive_features=sensitive_arr,
     )
     di_ratio = compute_disparate_impact_ratio(selection_rates)

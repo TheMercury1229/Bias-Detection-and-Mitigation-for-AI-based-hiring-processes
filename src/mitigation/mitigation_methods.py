@@ -12,15 +12,6 @@ from fairlearn.reductions import DemographicParity, EqualizedOdds, Exponentiated
 from sklearn.linear_model import LogisticRegression
 
 
-try:
-    from aif360.algorithms.preprocessing import Reweighing
-    from aif360.datasets import BinaryLabelDataset
-
-    AIF360_AVAILABLE = True
-except ImportError:
-    AIF360_AVAILABLE = False
-
-
 @dataclass(frozen=True)
 class ReweighingResult:
     """Container for reweighing outputs."""
@@ -74,6 +65,18 @@ def _validate_training_inputs(
     return X_df, y_series, sensitive_series
 
 
+def _ensure_binary_zero_one_labels(y_series: pd.Series, context: str) -> pd.Series:
+    """Ensure labels are binary {0,1} for Fairlearn mitigation algorithms."""
+    unique_values = sorted(pd.Series(y_series).dropna().unique().tolist())
+    if set(unique_values).issubset({0, 1}):
+        return y_series.astype(int)
+
+    raise ValueError(
+        f"{context} requires binary labels encoded as 0/1, but found labels: {unique_values}. "
+        "Choose a binary target column or preprocess labels to 0/1 before fairness mitigation."
+    )
+
+
 def _manual_reweighing(
         y_series: pd.Series,
         sensitive_series: pd.Series,
@@ -106,51 +109,15 @@ def apply_data_reweighing(
 ) -> ReweighingResult:
     """Apply data reweighing as a preprocessing mitigation method.
 
-    Uses AIF360 Reweighing when available. If AIF360-specific processing fails,
-    a statistically equivalent manual reweighing fallback is used.
+    Uses manual reweighing (statistically equivalent to AIF360 but memory-efficient).
+    This avoids memory overhead from AIF360 BinaryLabelDataset for large datasets.
     """
     X_df, y_series, sensitive_series = _validate_training_inputs(
         X_train, y_train, sensitive_features
     )
 
-    if AIF360_AVAILABLE:
-        try:
-            protected_name = "sensitive_feature"
-            label_name = "label"
-
-            protected_codes = sensitive_series.astype("category").cat.codes
-            labels = y_series.astype(int)
-            dataset_df = pd.DataFrame(
-                {protected_name: protected_codes, label_name: labels}
-            )
-
-            train_dataset = BinaryLabelDataset(
-                df=dataset_df,
-                label_names=[label_name],
-                protected_attribute_names=[protected_name],
-            )
-
-            rw = Reweighing(
-                unprivileged_groups=[{protected_name: 0}],
-                privileged_groups=[{protected_name: 1}],
-            )
-            transformed = rw.fit_transform(train_dataset)
-            sample_weights = pd.Series(
-                transformed.instance_weights,
-                name="sample_weight",
-            )
-
-            return ReweighingResult(
-                X_train=X_df,
-                y_train=y_series,
-                sensitive_features=sensitive_series,
-                sample_weights=sample_weights,
-                method_used="aif360_reweighing",
-            )
-        except Exception:
-            # Fall back to manual weighting to keep pipeline robust.
-            pass
-
+    # Use memory-efficient manual reweighing directly
+    # This is statistically equivalent to AIF360 but avoids data duplication
     sample_weights = _manual_reweighing(
         y_series=y_series, sensitive_series=sensitive_series)
 
@@ -174,6 +141,10 @@ def train_fairness_constrained_model(
     """Train a fairness-constrained model using Fairlearn reductions."""
     X_df, y_series, sensitive_series = _validate_training_inputs(
         X_train, y_train, sensitive_features
+    )
+    y_series = _ensure_binary_zero_one_labels(
+        y_series,
+        context="Fairness-Constrained Learning",
     )
 
     if base_estimator is None:
@@ -209,6 +180,10 @@ def train_threshold_optimizer(
     """Fit Fairlearn threshold optimization as post-processing mitigation."""
     X_df, y_series, sensitive_series = _validate_training_inputs(
         X_train, y_train, sensitive_features
+    )
+    y_series = _ensure_binary_zero_one_labels(
+        y_series,
+        context="Post-processing threshold optimization",
     )
 
     threshold_model = ThresholdOptimizer(

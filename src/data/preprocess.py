@@ -45,6 +45,43 @@ def encode_categorical_features(df: pd.DataFrame) -> pd.DataFrame:
     return pd.get_dummies(df, drop_first=False)
 
 
+def encode_binary_target(y: pd.Series) -> pd.Series:
+    """Encode binary target labels to {0,1} when needed.
+
+    This keeps the pipeline compatible with Fairlearn methods that require
+    binary labels in {0,1}.
+    """
+    target = y.reset_index(drop=True)
+    unique_values = pd.Series(target).dropna().unique().tolist()
+
+    if len(unique_values) != 2:
+        return target
+
+    # If already numeric binary, normalize to 0/1 as needed.
+    if set(unique_values).issubset({0, 1}):
+        return target.astype(int)
+    if set(unique_values).issubset({-1, 1}):
+        return target.map({-1: 0, 1: 1}).astype(int)
+
+    normalized_to_original = {
+        str(value).strip().lower(): value for value in unique_values
+    }
+    preferred_positive = ["1", "true", "yes", "y", "hired", "positive"]
+
+    positive_label = None
+    for candidate in preferred_positive:
+        if candidate in normalized_to_original:
+            positive_label = normalized_to_original[candidate]
+            break
+
+    if positive_label is None:
+        positive_label = sorted(
+            unique_values, key=lambda value: str(value).lower())[-1]
+
+    encoded = target.map(lambda value: 1 if value == positive_label else 0)
+    return encoded.astype(int)
+
+
 def resolve_sensitive_attribute(
         df: pd.DataFrame, sensitive_attributes: str | Iterable[str]
 ) -> str:
@@ -100,7 +137,7 @@ def preprocess_dataset(
 
     processed = fill_missing_values(df)
 
-    y = processed[target_column]
+    y = encode_binary_target(processed[target_column])
     sensitive_feature = processed[sensitive_column]
 
     feature_columns = [
@@ -112,7 +149,24 @@ def preprocess_dataset(
     X = processed[feature_columns]
     X = encode_categorical_features(X)
 
-    stratify = y if stratify_target and y.nunique(dropna=False) > 1 else None
+    # Validate minimum class distribution for stratified split
+    # For highly imbalanced data, stratification may fail on subgroups
+    stratify = None
+    if stratify_target and y.nunique(dropna=False) > 1:
+        value_counts = y.value_counts(dropna=False)
+        min_class_count = value_counts.min()
+
+        # Check if all classes have at least 2 samples (required by sklearn)
+        if min_class_count >= 2:
+            # Verify that test set will also have minimum samples per class
+            expected_min_test_samples = int(min_class_count * test_size)
+            if expected_min_test_samples >= 1:
+                try:
+                    stratify = y
+                except Exception:
+                    # If stratification fails, fall back to random split silently
+                    stratify = None
+        # For imbalanced classes, silently skip stratification to reduce warnings
 
     (
         X_train,

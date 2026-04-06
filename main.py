@@ -5,27 +5,45 @@ python main.py --data data/hiring.csv --target hired --sensitive gender
 """
 
 from __future__ import annotations
-
-import argparse
-import json
-from pathlib import Path
-from typing import Any
-
-import pandas as pd
-from joblib import dump, load
-
-from src.bias_detection.bias_identifier import identify_bias_type
-from src.data.load_data import load_dataset
-from src.data.preprocess import preprocess_dataset
-from src.data.schema_validator import validate_dataset_schema
+from src.models.train_model import build_model, train_baseline_model, train_model
+from src.models.evaluate_model import compare_baseline_and_mitigated_models, evaluate_predictions
+from src.mitigation.strategy_simulator import simulate_mitigation_strategies
+from src.mitigation.strategy_recommender import recommend_mitigation_strategies
+from src.mitigation.strategy_comparator import compare_mitigation_strategies
 from src.mitigation.mitigation_methods import (
     apply_data_reweighing,
     train_fairness_constrained_model,
     train_threshold_optimizer,
 )
-from src.mitigation.strategy_recommender import recommend_mitigation_strategies
-from src.models.evaluate_model import compare_baseline_and_mitigated_models, evaluate_predictions
-from src.models.train_model import build_model, train_baseline_model, train_model
+from src.data.schema_validator import validate_dataset_schema
+from src.data.preprocess import preprocess_dataset
+from src.data.load_data import load_dataset
+from src.bias_detection.data_analyzer import (
+    analyze_group_distribution_and_selection_rate,
+)
+from src.bias_detection.correlation_analyzer import (
+    analyze_feature_correlation_with_sensitive_attribute,
+)
+from src.bias_detection.bias_diagnosis import diagnose_bias_root_causes
+from src.bias_detection.bias_identifier import identify_bias_type
+from joblib import dump, load
+import pandas as pd
+
+import argparse
+import json
+import os
+import sys
+import warnings
+from pathlib import Path
+from typing import Any
+
+# Configure runtime before importing modules that may transitively load TensorFlow/inFairness.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, module=r"inFairness.*")
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, module=r"keras.*")
 
 
 def ensure_output_dirs(base_dir: str | Path = "results") -> dict[str, Path]:
@@ -170,6 +188,90 @@ def apply_mitigation_strategy(
     return model, y_pred
 
 
+def _print_strategy_simulation_report(comparison_report: dict[str, Any]) -> None:
+    """Print a readable simulation summary for CLI users."""
+    simulation_df = pd.DataFrame(comparison_report["sorted_results"])
+    if simulation_df.empty:
+        print("No strategy simulation results available.")
+        return
+
+    display_columns = [
+        "strategy",
+        "accuracy",
+        "fairness",
+        "fairness_improvement",
+        "accuracy_retention",
+        "rank_score",
+    ]
+    available_columns = [
+        col for col in display_columns if col in simulation_df.columns]
+    print("\nStrategy simulation results:")
+    print(simulation_df[available_columns].to_string(index=False))
+    print(
+        "Best fairness strategy: "
+        f"{comparison_report['best_fairness_strategy']['strategy']}"
+    )
+    print(
+        "Best accuracy strategy: "
+        f"{comparison_report['best_accuracy_strategy']['strategy']}"
+    )
+    print(
+        "Balanced choice: "
+        f"{comparison_report['balanced_choice']['strategy']}"
+    )
+
+
+def _select_strategy_from_comparison(
+        comparison_report: dict[str, Any],
+        preferred_strategy: str | None = None,
+        interactive: bool = False,
+) -> str:
+    """Choose a mitigation strategy from ranked simulation results."""
+    ranked_results = comparison_report.get("sorted_results", [])
+    if not ranked_results:
+        return "Continuous Fairness Monitoring"
+
+    available_strategies = [result["strategy"] for result in ranked_results]
+    balanced_choice = comparison_report["balanced_choice"]["strategy"]
+
+    if preferred_strategy:
+        if preferred_strategy not in available_strategies:
+            raise ValueError(
+                f"Selected strategy '{preferred_strategy}' was not part of the simulation results."
+            )
+        return preferred_strategy
+
+    if not interactive:
+        return balanced_choice
+
+    print("\nAvailable mitigation strategies:")
+    for index, result in enumerate(ranked_results, start=1):
+        print(
+            f"{index}. {result['strategy']} | accuracy={result['accuracy']:.3f} | "
+            f"fairness={result['fairness']:.3f} | rank={result['rank_score']:.3f}"
+        )
+
+    prompt = (
+        f"Choose a strategy by number or name [default: {balanced_choice}]: "
+    )
+    selection = input(prompt).strip()
+    if not selection:
+        return balanced_choice
+
+    if selection.isdigit():
+        index = int(selection)
+        if 1 <= index <= len(ranked_results):
+            return ranked_results[index - 1]["strategy"]
+        raise ValueError("Strategy selection number is out of range.")
+
+    if selection in available_strategies:
+        return selection
+
+    raise ValueError(
+        f"Unknown strategy selection '{selection}'. Choose one of: {', '.join(available_strategies)}"
+    )
+
+
 def run_pipeline(
         data_path: str,
         target_column: str,
@@ -177,6 +279,8 @@ def run_pipeline(
         model_type: str,
         test_size: float,
         output_dir: str,
+    preferred_strategy: str | None = None,
+    interactive_selection: bool = False,
 ) -> dict[str, Any]:
     """Run the full baseline vs mitigated fairness pipeline."""
     output_paths = ensure_output_dirs(output_dir)
@@ -226,12 +330,53 @@ def run_pipeline(
             normalize=True, dropna=False).to_dict()
     )
 
+    positive_label = _infer_positive_label(df[target_column])
+
+    dataset_analysis = analyze_group_distribution_and_selection_rate(
+        df=df,
+        sensitive_attribute=sensitive_column,
+        target_column=target_column,
+        positive_label=positive_label,
+    )
+    correlation_analysis = analyze_feature_correlation_with_sensitive_attribute(
+        df=df.drop(columns=[target_column], errors="ignore"),
+        sensitive_attribute=sensitive_column,
+        top_k=5,
+    )
+
     bias_result = identify_bias_type(fairness_for_bias)
+    diagnosis_result = diagnose_bias_root_causes(
+        fairness_metrics=baseline_eval["fairness"],
+        dataset_distribution_analysis=dataset_analysis,
+        feature_correlation_analysis=correlation_analysis,
+    )
     strategy_result = recommend_mitigation_strategies(
         bias_result["detected_bias_type"])
     recommended = strategy_result.get("recommended_strategies", [])
-    selected_strategy = (
-        recommended[0]["name"] if recommended else "Continuous Fairness Monitoring"
+    recommended_strategies = [item["name"] for item in recommended] or [
+        "Continuous Fairness Monitoring"
+    ]
+
+    simulation_results = simulate_mitigation_strategies(
+        X_train=X_train,
+        X_test=X_test,
+        y_train=y_train,
+        y_test=y_test,
+        sensitive_train=sensitive_train,
+        sensitive_test=sensitive_test,
+        strategies=recommended_strategies,
+        model=baseline_model,
+        model_type=model_type,
+        sensitive_column=sensitive_column,
+        random_state=42,
+    )
+    comparison_report = compare_mitigation_strategies(simulation_results)
+
+    _print_strategy_simulation_report(comparison_report)
+    selected_strategy = _select_strategy_from_comparison(
+        comparison_report=comparison_report,
+        preferred_strategy=preferred_strategy,
+        interactive=interactive_selection,
     )
 
     baseline_state = {
@@ -242,6 +387,7 @@ def run_pipeline(
         "sensitive_test": sensitive_test,
         "sensitive_column": sensitive_column,
         "baseline_model": baseline_model,
+        "baseline_model_type": model_type,
         "y_pred_baseline": y_pred_baseline,
     }
 
@@ -269,7 +415,13 @@ def run_pipeline(
             "selected_strategy": selected_strategy,
         },
         "bias_result": bias_result,
+        "dataset_analysis": dataset_analysis,
+        "correlation_analysis": correlation_analysis,
+        "bias_diagnosis": diagnosis_result,
         "strategy_result": strategy_result,
+        "strategy_simulation": simulation_results,
+        "strategy_comparison": comparison_report,
+        "selected_strategy": selected_strategy,
         "comparison": comparison,
     }
 
@@ -301,6 +453,9 @@ def run_pipeline(
     pd.DataFrame([comparison["mitigated"]["fairness"]]).to_csv(
         reports_dir / "mitigated_fairness.csv", index=False
     )
+
+    with (reports_dir / "bias_diagnosis.json").open("w", encoding="utf-8") as f:
+        json.dump(diagnosis_result, f, indent=2)
 
     return result_bundle
 
@@ -342,6 +497,11 @@ def parse_args() -> argparse.Namespace:
         default="results",
         help="Base output directory for reports and plots.",
     )
+    parser.add_argument(
+        "--strategy",
+        default=None,
+        help="Optional mitigation strategy to apply after simulation. If omitted, the balanced choice is used or you can select interactively.",
+    )
     return parser.parse_args()
 
 
@@ -376,6 +536,23 @@ def _infer_column(columns: list[str], preferred_names: list[str]) -> str | None:
         if name.lower() in normalized:
             return normalized[name.lower()]
     return None
+
+
+def _infer_positive_label(target_series: pd.Series) -> Any:
+    """Infer a positive target label for reporting-oriented diagnostics."""
+    values = target_series.dropna().unique().tolist()
+    if len(values) != 2:
+        return 1
+
+    if set(values).issubset({0, 1}) or set(values).issubset({-1, 1}):
+        return 1
+
+    normalized = {str(value).strip().lower(): value for value in values}
+    for candidate in ["1", "true", "yes", "y", "hired", "selected", "positive"]:
+        if candidate in normalized:
+            return normalized[candidate]
+
+    return sorted(values, key=lambda value: str(value).lower())[-1]
 
 
 def main() -> None:
@@ -420,10 +597,14 @@ def main() -> None:
         model_type=args.model_type,
         test_size=args.test_size,
         output_dir=args.output_dir,
+        preferred_strategy=args.strategy,
+        interactive_selection=sys.stdin.isatty(),
     )
 
     print("Pipeline completed successfully.")
     print(f"Detected bias: {results['bias_result']['detected_bias_type']}")
+    print("Bias diagnosis report:")
+    print(json.dumps(results["bias_diagnosis"], indent=2))
     print(
         "Selected mitigation strategy: "
         f"{results['config']['selected_strategy']}"
